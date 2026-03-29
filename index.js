@@ -26,6 +26,52 @@ const http = require('http');
 require('dotenv').config();
 
 // ═══════════════════════════════════════════════════════
+//  Keep Alive — ويب سيرفر للـ Render / Railway / أي هوستنق
+// ═══════════════════════════════════════════════════════
+
+function startKeepAlive() {
+    const PORT = process.env.PORT || 3000;
+
+    const server = http.createServer((req, res) => {
+        const url = req.url;
+
+        if (url === '/health' || url === '/healthz') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: 'ok',
+                uptime: process.uptime(),
+                timestamp: new Date().toISOString()
+            }));
+        } else {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                status: '✅ البوت شغال',
+                bot: client.user?.tag || 'جاري التشغيل...',
+                uptime: client.uptime ? formatUptime(client.uptime) : '0 ثانية',
+                guilds: client.guilds?.cache?.size || 0,
+                members: client.guilds?.cache?.reduce((a, g) => a + g.memberCount, 0) || 0,
+                ping: client.ws?.ping || 0,
+                broadcastActive: broadcastState.active,
+                timestamp: new Date().toISOString()
+            }));
+        }
+    });
+
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`  ▸ [KEEP-ALIVE] HTTP server شغال على بورت ${PORT}`);
+    });
+
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            console.log(`  ▸ [KEEP-ALIVE] البورت ${PORT} مستخدم — نجرب ${PORT + 1}`);
+            server.listen(PORT + 1, '0.0.0.0');
+        } else {
+            console.error('[KEEP-ALIVE] خطأ:', err.message);
+        }
+    });
+}
+
+// ═══════════════════════════════════════════════════════
 //  CONFIG — كل الإعدادات في مكان واحد
 // ═══════════════════════════════════════════════════════
 
@@ -321,7 +367,7 @@ function buildDmPayload(content) {
 }
 
 // ═══════════════════════════════════════════════════════
-//  حالة البرودكاست — نفس طريقة بوت اللعبة بالضبط
+//  حالة البرودكاست — مع دعم الإيقاف وإعادة المحاولة
 // ═══════════════════════════════════════════════════════
 
 let broadcastState = {
@@ -335,168 +381,85 @@ let broadcastState = {
     failedMembers: [],
     statusMessage: null,
     lastPayload: null,
+    lastContent: null,
     startTime: 0
 };
 
-// ═══════════════════════════════════════════════════════
-//  تنفيذ البرودكاست
-// ═══════════════════════════════════════════════════════
-
-async function executeBroadcast(guild, channel, broadcastContent, maxMembers = 0) {
-    const startTime = Date.now();
-
-    // جلب كل الأعضاء
-    await guild.members.fetch();
-
-    let members = guild.members.cache.filter(m => !m.user.bot).map(m => m);
-
-    if (maxMembers > 0 && maxMembers < members.length) {
-        for (let i = members.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [members[i], members[j]] = [members[j], members[i]];
-        }
-        members = members.slice(0, maxMembers);
-    }
-
-    const total = members.length;
-
-    if (total === 0) {
-        await channel.send({ embeds: [errorEmbed(guild, '❌ ما لقيت أعضاء!')] });
-        return { delivered: 0, failed: 0, blocked: 0, total: 0 };
-    }
-
-    let delivered = 0, failed = 0, blocked = 0;
-    const failedMembers = [];
-
-    console.log(`[BROADCAST] بدأ — ${total} عضو`);
-
-    // رسالة الحالة
-    const statusMsg = await channel.send(buildStatusEmbed(guild, total, 0, 0, 0, total, false, null));
-
-    const dmPayload = buildDmPayload(broadcastContent);
-
-    for (let i = 0; i < members.length; i++) {
-        const member = members[i];
-
-        try {
-            // نفتح DM channel أول ثم نرسل — أضمن من member.send
-            const dmChannel = await member.user.createDM();
-            await dmChannel.send(dmPayload);
-            delivered++;
-        } catch (err) {
-            // Rate Limit — ننتظر ونعيد
-            if (err.status === 429 || err.httpStatus === 429) {
-                // نحسب وقت الانتظار
-                let waitTime = 10000; // 10 ثواني افتراضي
-                if (err.retryAfter) {
-                    waitTime = err.retryAfter > 1000 ? err.retryAfter : err.retryAfter * 1000;
-                }
-                waitTime += 1000;
-
-                console.log(`[BROADCAST] Rate Limit — ننتظر ${Math.ceil(waitTime / 1000)}s`);
-
-                // نحدث الستاتس بحالة الانتظار
-                try {
-                    const processed = delivered + failed + blocked;
-                    const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
-                    await statusMsg.edit({ embeds: [makeEmbed(guild, {
-                        author: `📤 جاري الإرسال... ⏳ Rate Limit`,
-                        color: CONFIG.COLORS.WARNING,
-                        description: `⏳ **انتظار ${Math.ceil(waitTime / 1000)} ثانية...**`,
-                        fields: [
-                            { name: '🟢 وصل', value: `\`${delivered}\``, inline: true },
-                            { name: '🔴 فشل', value: `\`${failed}\``, inline: true },
-                            { name: '⛔ مقفول', value: `\`${blocked}\``, inline: true },
-                            { name: '⏳ متبقي', value: `\`${total - processed}\``, inline: true },
-                            { name: '📊 التقدم', value: progressBar(pct), inline: true },
-                            { name: '👥 الإجمالي', value: `\`${total}\``, inline: true }
-                        ]
-                    })] }).catch(() => {});
-                } catch {}
-
-                // ننتظر
-                await sleep(waitTime);
-
-                // نعيد المحاولة مرة وحدة
-                try {
-                    const dmChannel = await member.user.createDM();
-                    await dmChannel.send(dmPayload);
-                    delivered++;
-                } catch (retryErr) {
-                    if (retryErr.code === 50007) blocked++;
-                    else { failed++; failedMembers.push(member); }
-                }
-            }
-            // الخاص مقفول
-            else if (err.code === 50007) {
-                blocked++;
-            }
-            // أي خطأ ثاني
-            else {
-                failed++;
-                failedMembers.push(member);
-            }
-        }
-
-        // تحديث كل 5 رسائل أو آخر رسالة
-        if ((i + 1) % 5 === 0 || i === members.length - 1) {
-            const processed = delivered + failed + blocked;
-            const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
-            try {
-                await statusMsg.edit(buildStatusEmbed(guild, total, delivered, failed, blocked, total - processed, false, null));
-            } catch {}
-        }
-
-        // التأخير — 1.2 ثانية بين كل رسالة
-        if (i < members.length - 1) {
-            await sleep(CONFIG.DM_DELAY);
-        }
-    }
-
-    // التقرير النهائي
-    const elapsed = Date.now() - startTime;
-    const elapsedFormatted = formatUptime(elapsed);
-    const rate = total > 0 ? Math.round((delivered / total) * 100) : 0;
-
-    console.log(`[BROADCAST] انتهى — وصل: ${delivered} | فشل: ${failed} | مقفول: ${blocked} | ${rate}% | ${elapsedFormatted}`);
-
-    try {
-        await statusMsg.edit(buildStatusEmbed(guild, total, delivered, failed, blocked, 0, true, elapsedFormatted));
-    } catch {
-        await channel.send(buildStatusEmbed(guild, total, delivered, failed, blocked, 0, true, elapsedFormatted));
-    }
-
-    // حفظ الإحصائيات
-    const gd = getGuild(guild.id);
-    gd.stats.totalBroadcasts++;
-    gd.stats.totalDelivered += delivered;
-    gd.stats.totalFailed += failed;
-    gd.stats.totalBlocked += blocked;
-    gd.lastBroadcast = {
-        content: { ...broadcastContent },
-        timestamp: new Date().toISOString(),
-        stats: { delivered, failed, blocked, total }
-    };
-    saveGuild(guild.id, gd);
-
-    await sendLog(guild.id, CONFIG.COLORS.SUCCESS,
-        maxMembers > 0 ? 'برودكاست تجريبي' : 'برودكاست تم إرساله',
-        `🟢 وصل: **${delivered}** | 🔴 فشل: **${failed}** | ⛔ مقفول: **${blocked}** | 📊 النسبة: **${rate}%** | ⏱️ **${elapsedFormatted}**`,
-        'system'
-    );
-
-    return { delivered, failed, blocked, total };
+// ── ريست حالة البرودكاست ──
+function resetBroadcastState() {
+    broadcastState.active = false;
+    broadcastState.stopped = false;
+    broadcastState.totalMembers = 0;
+    broadcastState.sent = 0;
+    broadcastState.failed = 0;
+    broadcastState.blocked = 0;
+    broadcastState.remaining = 0;
+    broadcastState.failedMembers = [];
+    broadcastState.statusMessage = null;
+    broadcastState.lastPayload = null;
+    broadcastState.lastContent = null;
+    broadcastState.startTime = 0;
 }
 
 // ═══════════════════════════════════════════════════════
-//  بناء إمبد حالة البرودكاست
+//  بناء إمبد حالة البرودكاست — مع أزرار التحكم
 // ═══════════════════════════════════════════════════════
 
-function buildStatusEmbed(guild, total, delivered, failed, blocked, remaining, isFinal, elapsedTime) {
+function buildBroadcastStatusEmbed(guild, options = {}) {
+    const {
+        total = 0,
+        delivered = 0,
+        failed = 0,
+        blocked = 0,
+        remaining = 0,
+        isFinal = false,
+        isStopped = false,
+        isRetry = false,
+        elapsedTime = null,
+        isRateLimit = false,
+        waitSeconds = 0
+    } = options;
+
     const processed = delivered + failed + blocked;
     const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
     const rate = processed > 0 ? Math.round((delivered / processed) * 100) : 0;
 
+    // ── تحديد العنوان واللون ──
+    let author, color;
+    if (isFinal) {
+        if (isStopped) {
+            author = '⛔ تم إيقاف البرودكاست';
+            color = CONFIG.COLORS.WARNING;
+        } else {
+            author = isRetry ? '🔄 تقرير إعادة المحاولة' : '📊 التقرير النهائي';
+            color = delivered > 0 ? CONFIG.COLORS.SUCCESS : CONFIG.COLORS.ERROR;
+        }
+    } else if (isRateLimit) {
+        author = '📤 جاري الإرسال... ⏳ Rate Limit';
+        color = CONFIG.COLORS.WARNING;
+    } else {
+        author = isRetry ? '🔄 جاري إعادة المحاولة...' : '📤 جاري الإرسال...';
+        color = CONFIG.COLORS.INFO;
+    }
+
+    // ── الوصف ──
+    let description;
+    if (isRateLimit) {
+        description = `⏳ **انتظار ${waitSeconds} ثانية...**`;
+    } else if (isFinal) {
+        if (isStopped) {
+            description = `⛔ تم الإيقاف بواسطة المستخدم\n📬 تم إرسال **${delivered}** من **${total}**`;
+        } else {
+            description = '✅ اكتمل الإرسال';
+            if (rate < 50 && total > 0) {
+                description += '\n\n⚠️ **تحذير: نسبة النجاح أقل من 50%!**';
+            }
+        }
+    } else {
+        description = '🔄 جاري الإرسال...';
+    }
+
+    // ── الحقول ──
     const fields = [
         { name: '🟢 وصل', value: `\`${delivered}\``, inline: true },
         { name: '🔴 فشل', value: `\`${failed}\``, inline: true },
@@ -511,17 +474,400 @@ function buildStatusEmbed(guild, total, delivered, failed, blocked, remaining, i
         fields.push({ name: '📬 نسبة النجاح', value: progressBar(rate), inline: true });
     }
 
-    let description = isFinal ? '✅ اكتمل الإرسال' : '🔄 جاري الإرسال...';
-    if (isFinal && rate < 50 && total > 0) {
-        description += '\n\n⚠️ **تحذير: نسبة النجاح أقل من 50%!**';
+    const embed = makeEmbed(guild, { author, color, description, fields });
+
+    // ── الأزرار ──
+    const components = [];
+
+    if (!isFinal) {
+        // أثناء الإرسال — زر إيقاف
+        const stopBtn = new ButtonBuilder()
+            .setCustomId('broadcast_stop')
+            .setLabel('⛔ إيقاف')
+            .setStyle(ButtonStyle.Danger);
+        components.push(new ActionRowBuilder().addComponents(stopBtn));
+    } else {
+        // بعد الانتهاء — أزرار حسب الحالة
+        const buttons = [];
+
+        // لو فيه فاشلين — زر إعادة المحاولة
+        if (broadcastState.failedMembers.length > 0) {
+            buttons.push(new ButtonBuilder()
+                .setCustomId('broadcast_retry')
+                .setLabel(`🔄 إعادة للفاشلين (${broadcastState.failedMembers.length})`)
+                .setStyle(ButtonStyle.Primary));
+        }
+
+        // زر إغلاق دايماً
+        buttons.push(new ButtonBuilder()
+            .setCustomId('broadcast_dismiss')
+            .setLabel('🗑️ إغلاق')
+            .setStyle(ButtonStyle.Secondary));
+
+        components.push(new ActionRowBuilder().addComponents(buttons));
     }
 
-    return { embeds: [makeEmbed(guild, {
-        author: isFinal ? '📊 التقرير النهائي' : '📤 جاري الإرسال...',
-        color: isFinal ? (delivered > 0 ? CONFIG.COLORS.SUCCESS : CONFIG.COLORS.ERROR) : CONFIG.COLORS.INFO,
-        description,
-        fields
-    })] };
+    return { embeds: [embed], components };
+}
+
+// ═══════════════════════════════════════════════════════
+//  تنفيذ البرودكاست — مع إيقاف وإعادة محاولة
+// ═══════════════════════════════════════════════════════
+
+async function executeBroadcast(guild, channel, broadcastContent, maxMembers = 0) {
+    // ── تفعيل الحالة ──
+    resetBroadcastState();
+    broadcastState.active = true;
+    broadcastState.stopped = false;
+    broadcastState.startTime = Date.now();
+    broadcastState.lastContent = broadcastContent;
+
+    // ── جلب كل الأعضاء ──
+    await guild.members.fetch();
+
+    let members = guild.members.cache.filter(m => !m.user.bot).map(m => m);
+
+    // ── لو تجربة — نخلط ونأخذ عدد محدد ──
+    if (maxMembers > 0 && maxMembers < members.length) {
+        for (let i = members.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [members[i], members[j]] = [members[j], members[i]];
+        }
+        members = members.slice(0, maxMembers);
+    }
+
+    const total = members.length;
+    broadcastState.totalMembers = total;
+    broadcastState.remaining = total;
+
+    // ── لو ما فيه أعضاء ──
+    if (total === 0) {
+        resetBroadcastState();
+        await channel.send({ embeds: [errorEmbed(guild, '❌ ما لقيت أعضاء!')] });
+        return { delivered: 0, failed: 0, blocked: 0, total: 0 };
+    }
+
+    console.log(`[BROADCAST] بدأ — ${total} عضو`);
+
+    // ── بناء الـ payload ──
+    const dmPayload = buildDmPayload(broadcastContent);
+    broadcastState.lastPayload = dmPayload;
+
+    // ── رسالة الحالة مع زر الإيقاف ──
+    const statusMsg = await channel.send(buildBroadcastStatusEmbed(guild, {
+        total, delivered: 0, failed: 0, blocked: 0, remaining: total
+    }));
+    broadcastState.statusMessage = statusMsg;
+
+    // ── حلقة الإرسال ──
+    for (let i = 0; i < members.length; i++) {
+        // ── فحص الإيقاف ──
+        if (broadcastState.stopped) {
+            console.log(`[BROADCAST] تم الإيقاف عند العضو ${i + 1}/${total}`);
+            break;
+        }
+
+        const member = members[i];
+
+        try {
+            // نفتح DM channel أول ثم نرسل — أضمن من member.send
+            const dmChannel = await member.user.createDM();
+            await dmChannel.send(dmPayload);
+            broadcastState.sent++;
+        } catch (err) {
+            // ── Rate Limit — ننتظر ونعيد ──
+            if (err.status === 429 || err.httpStatus === 429) {
+                let waitTime = 10000;
+                if (err.retryAfter) {
+                    waitTime = err.retryAfter > 1000 ? err.retryAfter : err.retryAfter * 1000;
+                }
+                waitTime += 1000;
+                const waitSeconds = Math.ceil(waitTime / 1000);
+
+                console.log(`[BROADCAST] Rate Limit — ننتظر ${waitSeconds}s`);
+
+                // نحدث الستاتس بحالة الانتظار
+                try {
+                    await statusMsg.edit(buildBroadcastStatusEmbed(guild, {
+                        total,
+                        delivered: broadcastState.sent,
+                        failed: broadcastState.failed,
+                        blocked: broadcastState.blocked,
+                        remaining: total - (broadcastState.sent + broadcastState.failed + broadcastState.blocked),
+                        isRateLimit: true,
+                        waitSeconds
+                    }));
+                } catch {}
+
+                await sleep(waitTime);
+
+                // لو أوقف أثناء الانتظار
+                if (broadcastState.stopped) break;
+
+                // نعيد المحاولة مرة وحدة
+                try {
+                    const dmChannel = await member.user.createDM();
+                    await dmChannel.send(dmPayload);
+                    broadcastState.sent++;
+                } catch (retryErr) {
+                    if (retryErr.code === 50007) broadcastState.blocked++;
+                    else { broadcastState.failed++; broadcastState.failedMembers.push(member); }
+                }
+            }
+            // ── الخاص مقفول ──
+            else if (err.code === 50007) {
+                broadcastState.blocked++;
+            }
+            // ── أي خطأ ثاني ──
+            else {
+                broadcastState.failed++;
+                broadcastState.failedMembers.push(member);
+            }
+        }
+
+        // ── تحديث المتبقي ──
+        broadcastState.remaining = total - (i + 1);
+
+        // ── تحديث كل 5 رسائل أو آخر رسالة ──
+        if ((i + 1) % 5 === 0 || i === members.length - 1) {
+            if (!broadcastState.stopped) {
+                try {
+                    await statusMsg.edit(buildBroadcastStatusEmbed(guild, {
+                        total,
+                        delivered: broadcastState.sent,
+                        failed: broadcastState.failed,
+                        blocked: broadcastState.blocked,
+                        remaining: broadcastState.remaining
+                    }));
+                } catch {}
+            }
+        }
+
+        // ── التأخير بين كل رسالة ──
+        if (i < members.length - 1 && !broadcastState.stopped) {
+            await sleep(CONFIG.DM_DELAY);
+        }
+    }
+
+    // ── حسابات النهاية ──
+    const elapsed = Date.now() - broadcastState.startTime;
+    const elapsedFormatted = formatUptime(elapsed);
+    const delivered = broadcastState.sent;
+    const failed = broadcastState.failed;
+    const blocked = broadcastState.blocked;
+    const wasStopped = broadcastState.stopped;
+    const rate = total > 0 ? Math.round((delivered / total) * 100) : 0;
+
+    console.log(`[BROADCAST] ${wasStopped ? 'أوقف' : 'انتهى'} — وصل: ${delivered} | فشل: ${failed} | مقفول: ${blocked} | ${rate}% | ${elapsedFormatted}`);
+
+    // ── التقرير النهائي مع أزرار ──
+    try {
+        await statusMsg.edit(buildBroadcastStatusEmbed(guild, {
+            total, delivered, failed, blocked,
+            remaining: 0,
+            isFinal: true,
+            isStopped: wasStopped,
+            elapsedTime: elapsedFormatted
+        }));
+    } catch {
+        await channel.send(buildBroadcastStatusEmbed(guild, {
+            total, delivered, failed, blocked,
+            remaining: 0,
+            isFinal: true,
+            isStopped: wasStopped,
+            elapsedTime: elapsedFormatted
+        }));
+    }
+
+    // ── حفظ الإحصائيات ──
+    const gd = getGuild(guild.id);
+    gd.stats.totalBroadcasts++;
+    gd.stats.totalDelivered += delivered;
+    gd.stats.totalFailed += failed;
+    gd.stats.totalBlocked += blocked;
+    gd.lastBroadcast = {
+        content: { ...broadcastContent },
+        timestamp: new Date().toISOString(),
+        stats: { delivered, failed, blocked, total }
+    };
+    saveGuild(guild.id, gd);
+
+    // ── اللوق ──
+    await sendLog(guild.id, wasStopped ? CONFIG.COLORS.WARNING : CONFIG.COLORS.SUCCESS,
+        wasStopped ? 'تم إيقاف البرودكاست' : (maxMembers > 0 ? 'برودكاست تجريبي' : 'برودكاست تم إرساله'),
+        `🟢 وصل: **${delivered}** | 🔴 فشل: **${failed}** | ⛔ مقفول: **${blocked}** | 📊 النسبة: **${rate}%** | ⏱️ **${elapsedFormatted}**`,
+        'system'
+    );
+
+    // ── تعطيل الحالة ──
+    broadcastState.active = false;
+
+    return { delivered, failed, blocked, total };
+}
+
+// ═══════════════════════════════════════════════════════
+//  إعادة الإرسال للفاشلين فقط
+// ═══════════════════════════════════════════════════════
+
+async function retryBroadcast(guild, channel) {
+    const failedList = [...broadcastState.failedMembers];
+
+    if (failedList.length === 0) {
+        await channel.send({ embeds: [errorEmbed(guild, '❌ ما فيه أعضاء فاشلين لإعادة الإرسال!')] });
+        return;
+    }
+
+    // ── حفظ الـ payload من البرودكاست السابق ──
+    const dmPayload = broadcastState.lastPayload;
+    if (!dmPayload) {
+        await channel.send({ embeds: [errorEmbed(guild, '❌ ما لقيت بيانات الرسالة السابقة!')] });
+        return;
+    }
+
+    // ── ريست الحالة للإعادة ──
+    const savedPayload = dmPayload;
+    const savedContent = broadcastState.lastContent;
+
+    resetBroadcastState();
+    broadcastState.active = true;
+    broadcastState.stopped = false;
+    broadcastState.startTime = Date.now();
+    broadcastState.lastPayload = savedPayload;
+    broadcastState.lastContent = savedContent;
+
+    const total = failedList.length;
+    broadcastState.totalMembers = total;
+    broadcastState.remaining = total;
+
+    console.log(`[BROADCAST-RETRY] بدأ — ${total} عضو فاشل`);
+
+    // ── رسالة الحالة ──
+    const statusMsg = await channel.send(buildBroadcastStatusEmbed(guild, {
+        total, delivered: 0, failed: 0, blocked: 0, remaining: total, isRetry: true
+    }));
+    broadcastState.statusMessage = statusMsg;
+
+    // ── حلقة الإرسال ──
+    for (let i = 0; i < failedList.length; i++) {
+        if (broadcastState.stopped) {
+            console.log(`[BROADCAST-RETRY] تم الإيقاف عند ${i + 1}/${total}`);
+            break;
+        }
+
+        const member = failedList[i];
+
+        try {
+            const dmChannel = await member.user.createDM();
+            await dmChannel.send(savedPayload);
+            broadcastState.sent++;
+        } catch (err) {
+            if (err.status === 429 || err.httpStatus === 429) {
+                let waitTime = 10000;
+                if (err.retryAfter) {
+                    waitTime = err.retryAfter > 1000 ? err.retryAfter : err.retryAfter * 1000;
+                }
+                waitTime += 1000;
+                const waitSeconds = Math.ceil(waitTime / 1000);
+
+                console.log(`[BROADCAST-RETRY] Rate Limit — ننتظر ${waitSeconds}s`);
+
+                try {
+                    await statusMsg.edit(buildBroadcastStatusEmbed(guild, {
+                        total,
+                        delivered: broadcastState.sent,
+                        failed: broadcastState.failed,
+                        blocked: broadcastState.blocked,
+                        remaining: total - (broadcastState.sent + broadcastState.failed + broadcastState.blocked),
+                        isRetry: true, isRateLimit: true, waitSeconds
+                    }));
+                } catch {}
+
+                await sleep(waitTime);
+                if (broadcastState.stopped) break;
+
+                try {
+                    const dmChannel = await member.user.createDM();
+                    await dmChannel.send(savedPayload);
+                    broadcastState.sent++;
+                } catch (retryErr) {
+                    if (retryErr.code === 50007) broadcastState.blocked++;
+                    else { broadcastState.failed++; broadcastState.failedMembers.push(member); }
+                }
+            } else if (err.code === 50007) {
+                broadcastState.blocked++;
+            } else {
+                broadcastState.failed++;
+                broadcastState.failedMembers.push(member);
+            }
+        }
+
+        broadcastState.remaining = total - (i + 1);
+
+        // تحديث كل 5 رسائل أو آخر رسالة
+        if ((i + 1) % 5 === 0 || i === failedList.length - 1) {
+            if (!broadcastState.stopped) {
+                try {
+                    await statusMsg.edit(buildBroadcastStatusEmbed(guild, {
+                        total,
+                        delivered: broadcastState.sent,
+                        failed: broadcastState.failed,
+                        blocked: broadcastState.blocked,
+                        remaining: broadcastState.remaining,
+                        isRetry: true
+                    }));
+                } catch {}
+            }
+        }
+
+        if (i < failedList.length - 1 && !broadcastState.stopped) {
+            await sleep(CONFIG.DM_DELAY);
+        }
+    }
+
+    // ── النهاية ──
+    const elapsed = Date.now() - broadcastState.startTime;
+    const elapsedFormatted = formatUptime(elapsed);
+    const delivered = broadcastState.sent;
+    const failed = broadcastState.failed;
+    const blocked = broadcastState.blocked;
+    const wasStopped = broadcastState.stopped;
+
+    console.log(`[BROADCAST-RETRY] ${wasStopped ? 'أوقف' : 'انتهى'} — وصل: ${delivered} | فشل: ${failed} | مقفول: ${blocked}`);
+
+    try {
+        await statusMsg.edit(buildBroadcastStatusEmbed(guild, {
+            total, delivered, failed, blocked,
+            remaining: 0,
+            isFinal: true,
+            isStopped: wasStopped,
+            isRetry: true,
+            elapsedTime: elapsedFormatted
+        }));
+    } catch {
+        await channel.send(buildBroadcastStatusEmbed(guild, {
+            total, delivered, failed, blocked,
+            remaining: 0,
+            isFinal: true,
+            isStopped: wasStopped,
+            isRetry: true,
+            elapsedTime: elapsedFormatted
+        }));
+    }
+
+    // ── تحديث الإحصائيات ──
+    const gd = getGuild(guild.id);
+    gd.stats.totalDelivered += delivered;
+    gd.stats.totalFailed += failed;
+    gd.stats.totalBlocked += blocked;
+    saveGuild(guild.id, gd);
+
+    await sendLog(guild.id, wasStopped ? CONFIG.COLORS.WARNING : CONFIG.COLORS.SUCCESS,
+        'إعادة إرسال للفاشلين',
+        `🟢 وصل: **${delivered}** | 🔴 فشل: **${failed}** | ⛔ مقفول: **${blocked}** | ⏱️ **${elapsedFormatted}**`,
+        'system'
+    );
+
+    broadcastState.active = false;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -534,9 +880,12 @@ async function broadcastFlow(message, isTest = false) {
     const guild = message.guild;
     const guildId = guild.id;
 
-    // تأكد ما فيه برودكاست شغال
+    // ── تأكد ما فيه برودكاست شغال — مع تفاصيل ──
     if (broadcastState.active) {
-        return message.reply({ embeds: [errorEmbed(guild, '❌ فيه برودكاست شغال حالياً — انتظر يخلص!')] });
+        const elapsed = formatUptime(Date.now() - broadcastState.startTime);
+        return message.reply({
+            embeds: [errorEmbed(guild, `❌ فيه برودكاست شغال حالياً!\n\n📊 الحالة: وصل **${broadcastState.sent}** | فشل **${broadcastState.failed}** | متبقي **${broadcastState.remaining}**\n⏱️ من: **${elapsed}**\n\n> انتظر يخلص أو أوقفه من زر ⛔`)]
+        });
     }
 
     // ═══ الخطوة 1: نوع المحتوى ═══
@@ -1089,11 +1438,106 @@ client.once('ready', async () => {
 
     await loadAllSchedules();
 
+    // ── تشغيل الويب سيرفر ──
+    startKeepAlive();
+
     const data = loadData();
     for (const [guildId, gd] of Object.entries(data)) {
         if (gd.logChannelId) {
             await sendLog(guildId, CONFIG.COLORS.SUCCESS, 'البوت شغال',
                 `🖥️ السيرفرات: **${client.guilds.cache.size}** | ⚡ البينق: **${client.ws.ping}ms**`, 'system');
+        }
+    }
+});
+
+// ═══════════════════════════════════════════════════════
+//  معالجة أزرار البرودكاست — stop / retry / dismiss
+// ═══════════════════════════════════════════════════════
+
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    if (!interaction.guild) return;
+
+    const guild = interaction.guild;
+    const userId = interaction.user.id;
+
+    // ── تحقق من الصلاحية ──
+    if (!['broadcast_stop', 'broadcast_retry', 'broadcast_dismiss'].includes(interaction.customId)) return;
+
+    if (!isAdmin(userId, guild.id)) {
+        return interaction.reply({
+            embeds: [errorEmbed(guild, '🔒 ما عندك صلاحية لاستخدام هذا الزر')],
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
+    // ── زر الإيقاف ──
+    if (interaction.customId === 'broadcast_stop') {
+        if (!broadcastState.active) {
+            return interaction.reply({
+                embeds: [errorEmbed(guild, '❌ ما فيه برودكاست شغال حالياً')],
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        broadcastState.stopped = true;
+
+        await interaction.reply({
+            embeds: [makeEmbed(guild, {
+                author: '⛔ جاري الإيقاف...',
+                color: CONFIG.COLORS.WARNING,
+                description: `تم طلب الإيقاف بواسطة <@${userId}>\nالبرودكاست بيوقف بعد الرسالة الحالية...`
+            })],
+            flags: MessageFlags.Ephemeral
+        });
+
+        await sendLog(guild.id, CONFIG.COLORS.WARNING, 'إيقاف برودكاست',
+            `⛔ بواسطة <@${userId}> | وصل: **${broadcastState.sent}** | فشل: **${broadcastState.failed}**`, userId);
+    }
+
+    // ── زر إعادة المحاولة ──
+    else if (interaction.customId === 'broadcast_retry') {
+        if (broadcastState.active) {
+            return interaction.reply({
+                embeds: [errorEmbed(guild, '❌ فيه برودكاست شغال حالياً — انتظر يخلص!')],
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        if (broadcastState.failedMembers.length === 0) {
+            return interaction.reply({
+                embeds: [errorEmbed(guild, '❌ ما فيه أعضاء فاشلين!')],
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        await interaction.reply({
+            embeds: [makeEmbed(guild, {
+                author: '🔄 جاري إعادة الإرسال...',
+                color: CONFIG.COLORS.INFO,
+                description: `إعادة الإرسال لـ **${broadcastState.failedMembers.length}** عضو فاشل`
+            })],
+            flags: MessageFlags.Ephemeral
+        });
+
+        await sendLog(guild.id, CONFIG.COLORS.INFO, 'إعادة إرسال للفاشلين',
+            `🔄 بواسطة <@${userId}> | العدد: **${broadcastState.failedMembers.length}**`, userId);
+
+        const ch = await guild.channels.fetch(interaction.channelId).catch(() => null);
+        if (ch) {
+            await retryBroadcast(guild, ch);
+        }
+    }
+
+    // ── زر الإغلاق ──
+    else if (interaction.customId === 'broadcast_dismiss') {
+        try {
+            await interaction.message.delete();
+        } catch {
+            await interaction.reply({
+                embeds: [errorEmbed(guild, '❌ ما قدرت أحذف الرسالة')],
+                flags: MessageFlags.Ephemeral
+            });
         }
     }
 });
